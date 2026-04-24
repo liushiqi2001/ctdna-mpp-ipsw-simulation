@@ -1,0 +1,830 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-10-12"
+---
+
+# test
+```{r}
+rm(list = ls())
+library(survival)
+library(writexl)
+library(dplyr)
+get_robust_variance_complete <- function(dat, beta.hat, cox_model, p = 2, weight_cap = 50) {
+  
+  ids <- unique(dat$id)
+  n <- length(ids)
+  Z <- as.matrix(dat[, c("z1", "z2")])
+  
+  linear_predictor <- as.vector(Z %*% beta.hat)
+  exp_zb <- exp(linear_predictor)
+  
+  dat$weight <- pmin(dat$weight, weight_cap)
+  weight_orig <- dat$weight
+  
+  dH <- dat$dH
+  R <- dat$R
+  unique_event_times <- sort(unique(dat$time[dat$dH != 0 & !is.na(dat$dH)]))
+  
+  get_score_vector <- function(current_weights) {
+    U_vec <- rep(0, p)
+    for (t in unique_event_times) {
+      idx_t <- which(dat$time == t)
+      if(length(idx_t) == 0) next
+      
+      Z_t <- Z[idx_t, , drop=FALSE]
+      w_t <- current_weights[idx_t]
+      R_t <- R[idx_t]
+      exp_zb_t <- exp_zb[idx_t]
+      
+      term <- w_t * R_t * exp_zb_t
+      s0 <- sum(term)
+      if (s0 <= 1e-12) next
+      
+      s1 <- colSums(Z_t * term)
+      z_bar <- s1 / s0
+      
+      dH_t <- dH[idx_t]; dH_t[is.na(dH_t)] <- 0
+      weighted_dH <- w_t * dH_t
+      sum_wdH <- sum(weighted_dH)
+      
+      term_1 <- colSums(Z_t * weighted_dH)
+      term_2 <- z_bar * sum_wdH
+      U_vec <- U_vec + (term_1 - term_2)
+    }
+    return(U_vec)
+  }
+  
+  A_mat <- matrix(0, nrow = p, ncol = p)
+  for (t in unique_event_times) {
+    idx_t <- which(dat$time == t)
+    Z_t <- Z[idx_t, , drop = FALSE]
+    w_t <- weight_orig[idx_t]
+    R_t <- R[idx_t]
+    exp_zb_t <- exp_zb[idx_t]
+    
+    term <- w_t * R_t * exp_zb_t
+    s0 <- sum(term) / n
+    if (s0 <= 1e-12) next
+    
+    s1 <- colSums(Z_t * term) / n
+    s2 <- matrix(0, p, p)
+    for (k in 1:length(idx_t)) {
+      z_k <- Z_t[k, ]
+      s2 <- s2 + term[k] * (z_k %*% t(z_k))
+    }
+    s2 <- s2 / n
+    
+    z_bar <- s1 / s0
+    V_t <- (s2 / s0) - (z_bar %*% t(z_bar))
+    
+    dH_t <- dH[idx_t]; dH_t[is.na(dH_t)] <- 0
+    sum_weighted_dH <- sum(w_t * dH_t)
+    
+    A_mat <- A_mat + (V_t * sum_weighted_dH)
+  }
+  A_mat <- A_mat / n
+  
+  dLambda0_list <- list(); z_bar_list <- list()
+  for (t in unique_event_times) {
+    idx_t <- which(dat$time == t)
+    term_c <- weight_orig[idx_t] * R[idx_t] * exp_zb[idx_t]
+    s0 <- sum(term_c)
+    dH_v <- dH[idx_t]; dH_v[is.na(dH_v)] <- 0
+    term_n <- sum(weight_orig[idx_t] * dH_v)
+    
+    if (s0 > 1e-12) {
+      dLambda0_list[[as.character(t)]] <- term_n / s0
+      s1 <- colSums(Z[idx_t, , drop=FALSE] * term_c)
+      z_bar_list[[as.character(t)]] <- s1 / s0
+    } else {
+      dLambda0_list[[as.character(t)]] <- 0
+      z_bar_list[[as.character(t)]] <- rep(0, p)
+    }
+  }
+  
+  eta_matrix <- matrix(0, nrow = n, ncol = p)
+  rownames(eta_matrix) <- ids
+  
+  for (i in 1:n) {
+    sub_id <- ids[i]
+    sub_idx <- which(dat$id == sub_id)
+    sub_dat <- dat[sub_idx, ]
+    integral_term <- rep(0, p)
+    
+    valid_k <- which(!is.na(sub_dat$dH))
+    for (k in valid_k) {
+      t_char <- as.character(sub_dat$time[k])
+      if (is.null(dLambda0_list[[t_char]])) next
+      
+      dL <- dLambda0_list[[t_char]]
+      inte <- sub_dat$R[k] * exp(sum(Z[sub_idx[k], ] * beta.hat)) * dL
+      dM <- weight_orig[sub_idx[k]] * (sub_dat$dH[k] - inte)
+      
+      z_bar <- z_bar_list[[t_char]]
+      if (!is.null(z_bar)) {
+        integral_term <- integral_term + (Z[sub_idx[k], ] - z_bar) * dM
+      }
+    }
+    eta_matrix[i, ] <- integral_term
+  }
+  
+  psi_matrix <- matrix(0, nrow = n, ncol = p)
+  
+  if (!inherits(cox_model, "try-error") && !is.null(cox_model)) {
+    dfbeta_mat <- residuals(cox_model, type = "dfbeta")
+    
+    if(nrow(dfbeta_mat) == n) { 
+      coef_orig <- coef(cox_model)
+      q <- length(coef_orig)
+      epsilon <- 1e-4 
+      D_mat <- matrix(0, nrow = p, ncol = q)
+      U_orig <- get_score_vector(weight_orig)
+      
+      for (j in 1:q) {
+        gamma_diff <- rep(0, q); gamma_diff[j] <- epsilon
+        lp_diff <- as.vector(Z %*% gamma_diff)
+        factor <- exp(lp_diff)
+        factor <- pmin(pmax(factor, 0.5), 2.0)
+        
+        w_new <- weight_orig * factor
+        w_new <- pmin(w_new, weight_cap) 
+        
+        U_new <- get_score_vector(w_new)
+        D_mat[, j] <- (U_new - U_orig) / epsilon
+      }
+      psi_matrix <- dfbeta_mat %*% t(D_mat)
+    }
+  }
+  
+  total_influence <- eta_matrix + psi_matrix
+  Sigma_mat <- t(total_influence) %*% total_influence / n
+  
+  A_inv <- try(solve(A_mat), silent = TRUE)
+  if (inherits(A_inv, "try-error")) return(matrix(NA, p, p))
+  
+  Var_Beta <- (A_inv %*% Sigma_mat %*% A_inv) / n
+  return(Var_Beta)
+}
+
+ipsw.fit.information_censor <- function(dat, p = 2) {
+  
+  surv.dat <- dat[!duplicated(dat$id), ]
+  cox_model <- try(coxph(Surv(X, delta) ~ z1 + z2, data = surv.dat, x = TRUE), silent = TRUE)
+  
+  if (inherits(cox_model, "try-error")) {
+    return(list(beta.hat = rep(NA, p), se.hat = rep(NA, p)))
+  }
+  
+  s_fit_curves <- survfit(cox_model, newdata = dat, se.fit = FALSE)
+  
+  times_idx <- match(dat$time, s_fit_curves$time)
+  st_vals <- s_fit_curves$surv[cbind(times_idx, 1:nrow(dat))]
+  
+  st_vals[is.na(st_vals)] <- 1e-8
+  st_vals[st_vals < 1e-8] <- 1e-8 
+  
+  dat$weight <- ifelse(dat$X >= dat$time, 1 / st_vals, 0)
+  
+  dH <- dat$dH
+  Z <- as.matrix(dat[, c("z1", "z2")])
+  R <- dat$R
+  weight <- dat$weight
+  
+  objective.func <- function(beta) {
+    linear_predictor <- as.vector(Z %*% beta)
+    exp_zb <- exp(linear_predictor)
+    s0_beta <- R * weight * exp_zb
+    s0_by_time <- tapply(s0_beta, dat$time, sum, na.rm = TRUE)
+    s0_full <- s0_by_time[as.character(dat$time)]
+    s0_full[s0_full <= 0] <- 1e-8 # 补丁
+    
+    log_term <- log(s0_full)
+    obj_val <- sum((linear_predictor - log_term) * dH * weight * R, na.rm = TRUE)
+    return(-obj_val)
+  }
+  
+  opt_result <- optim(par = rep(0, p), f = objective.func, method = "BFGS", hessian = TRUE)
+  se.hat <- rep(NA, p)
+  
+  if (opt_result$convergence == 0) {
+    robust_var <- try(get_robust_variance_complete(dat, opt_result$par, cox_model, p, weight_cap = 50), silent = TRUE)
+    
+    if (!inherits(robust_var, "try-error") && !any(is.na(robust_var)) && all(diag(robust_var) > 0)) {
+      se.hat <- sqrt(diag(robust_var))
+    } else {
+      cov_matrix_naive <- try(solve(opt_result$hessian), silent = TRUE)
+      if (!inherits(cov_matrix_naive, "try-error") && all(diag(cov_matrix_naive) > 0)) {
+        se.hat <- sqrt(diag(cov_matrix_naive))
+      }
+    }
+  }
+  return(list(beta.hat = opt_result$par, se.hat = se.hat))
+}
+```
+# sd^2 = 0 logNorm
+```{r}
+scenarios <- expand.grid(
+  N = c(200, 500),
+  censoring_level = c("Low", "High"),
+  effect_size = c("Small")
+)
+
+scenarios$seed <- rep(3, 2) 
+all_results_list <- list()
+for (i in 1:nrow(scenarios)) {
+  
+  current_N <- scenarios$N[i]
+  current_censoring <- scenarios$censoring_level[i]
+  current_effect <- scenarios$effect_size[i]
+  current_seed <- scenarios$seed[i]
+  
+  set.seed(current_seed)
+  
+  cat(paste0("\n--- Running Scenario ", i, "/", nrow(scenarios), ": ",
+             "N=", current_N, ", Censoring=", current_censoring, ", Effect=", current_effect, 
+             ", Seed=", current_seed, " ---\n"))
+  
+  if (current_effect == "Large") {
+    beta1.true <- 0.5; beta2.true <- 0.5; gamma1.true <- 1; gamma2.true <- 0.9 
+  } else { 
+    beta1.true <- 0.5; beta2.true <- 0.4; gamma1.true <- 0.5; gamma2.true <- 0.6
+  }
+  beta0.true <- c(beta1.true + gamma1.true, beta2.true + gamma2.true)
+  
+  rep <- 200
+  max_time <- 10  
+  surv_eff <- c(-0.5, 0.5)
+  p0 <- function(t) {0.25 + 0.05 * sin(t / max_time * 2 * pi) } 
+  mu0 <- function(t) {20 + 5 * cos(t / max_time * 2 * pi) } 
+  t_obs <- 1: max_time        
+  prob.observe <- 0.8        
+  
+  beta.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  se.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  
+  for (it in 1:rep) {
+    z1_baseline <- runif(current_N, 0, 1)
+    z2_baseline <- rbinom(current_N, 1, 0.5)
+    
+    sd_noise <- sqrt(0)
+    mu_correction <- -0.5 * sd_noise^2
+    
+    u_event  <- rlnorm(current_N, meanlog = mu_correction, sdlog = sd_noise)
+    u_marker <- rlnorm(current_N, meanlog = mu_correction, sdlog = 0)
+    
+    u_event_long  <- rep(u_event, each = length(t_obs))
+    u_marker_long <- rep(u_marker, each = length(t_obs))
+    u_root <- sqrt(u_event_long)
+    
+    death_rate <- 0.1 * exp(z1_baseline * surv_eff[1] + z2_baseline * surv_eff[2])* u_event_long
+    T_pat <- rexp(current_N, rate = death_rate)
+    
+    if (current_censoring == "High") {
+      baseline_censor_rate <- 0.1
+    } else { 
+      baseline_censor_rate <- 0.05
+    }
+    censoring_rate <- baseline_censor_rate * exp(z1_baseline * (-0.5) + z2_baseline * 0.5)
+    C_pat <- rexp(current_N, rate = censoring_rate)
+    
+    X_pat <- pmin(T_pat, C_pat)
+    delta_pat <- as.numeric(T_pat <= C_pat)
+    
+    sim.data <- data.frame(id = rep(1:current_N, each = length(t_obs)),
+                           time = rep(t_obs, current_N), X = rep(X_pat, each = length(t_obs)),
+                           delta = rep(delta_pat, each = length(t_obs)))
+    
+    sim.data$z1 <- rep(z1_baseline, each = length(t_obs))
+    sim.data$z2 <- rep(z2_baseline, each = length(t_obs))
+    
+    sim.data$R <- rbinom(nrow(sim.data), 1, prob.observe)
+    sim.data$R[sim.data$time > sim.data$X] <- 0
+    
+    linear_pred <- sim.data$z1 * beta1.true + sim.data$z2 * beta2.true 
+    prob_event <- p0(sim.data$time) * exp(linear_pred)* u_root
+    
+    prob_event[is.na(prob_event)] <- 0
+    prob_event <- pmin(prob_event, 1) 
+    prob_event[sim.data$time > sim.data$X] <- 0
+    
+    sim.data$dN <- rbinom(nrow(sim.data), 1, prob_event)
+    
+    linear_marker <- sim.data$z1 * gamma1.true + sim.data$z2 * gamma2.true
+    mean_marker <- mu0(sim.data$time) * exp(linear_marker) * u_root
+    
+    sim.data$Y <- 0
+    idx_event <- which(sim.data$dN == 1)
+    sim.data$Y[idx_event] <- rpois(length(idx_event), lambda = pmax(0, mean_marker[idx_event]))
+    
+    sim.data$dH <- sim.data$Y * sim.data$dN 
+    sim.data$dH[sim.data$R == 0] <- NA
+    
+    model_dat <- sim.data[sim.data$time <= sim.data$X, ]
+    
+    # 拟合
+    main_fit_result <- try(ipsw.fit.information_censor(model_dat, p = 2), silent = TRUE)
+    
+    if (!inherits(main_fit_result, "try-error")) {
+      beta.hat.matrix[it, ] <- main_fit_result$beta.hat
+      se.hat.matrix[it, ] <- main_fit_result$se.hat
+    }
+  }
+  
+  valid_runs <- which(!is.na(beta.hat.matrix[,1]) & !is.na(se.hat.matrix[,1]))
+  
+  if (length(valid_runs) > 1) {
+    valid_beta <- beta.hat.matrix[valid_runs, , drop=FALSE]
+    valid_se   <- se.hat.matrix[valid_runs, , drop=FALSE]
+    
+    bias <- colMeans(valid_beta) - beta0.true
+    ese <- apply(valid_beta, 2, sd)
+    ase <- colMeans(valid_se)
+    mse <- colMeans((valid_beta - matrix(beta0.true, nrow = nrow(valid_beta), ncol = 2, byrow = TRUE))^2)
+    
+    lower_bound <- valid_beta - 1.96 * valid_se
+    upper_bound <- valid_beta + 1.96 * valid_se
+    
+    cp_1 <- mean(lower_bound[,1] <= beta0.true[1] & upper_bound[,1] >= beta0.true[1])
+    cp_2 <- mean(lower_bound[,2] <= beta0.true[2] & upper_bound[,2] >= beta0.true[2])
+    cp <- c(cp_1, cp_2)
+    
+    results_summary <- data.frame(
+      Parameter = c("beta0_1", "beta0_2"),
+      TrueValue = beta0.true,
+      MeanEst = colMeans(valid_beta),
+      Bias = bias,
+      Empirical_SE = ese, 
+      Mean_Model_SE = ase, 
+      MSE = mse,
+      CP = cp
+    )
+    
+    scenario_info <- scenarios[i, , drop = FALSE]
+    rownames(scenario_info) <- NULL
+    full_results <- cbind(scenario_info, results_summary)
+    all_results_list[[i]] <- full_results
+  }
+}
+
+final_results <- do.call(rbind, all_results_list)
+print(final_results %>% as.data.frame())
+
+table_1 = final_results %>% as.data.frame()
+```
+# sd^2 = 0.1 logNorm
+```{r}
+scenarios <- expand.grid(
+  N = c(200, 500),
+  censoring_level = c("Low", "High"),
+  effect_size = c("Small")
+)
+
+scenarios$seed <- rep(3, 2) 
+all_results_list <- list()
+for (i in 1:nrow(scenarios)) {
+  
+  current_N <- scenarios$N[i]
+  current_censoring <- scenarios$censoring_level[i]
+  current_effect <- scenarios$effect_size[i]
+  current_seed <- scenarios$seed[i]
+  
+  set.seed(current_seed)
+  
+  cat(paste0("\n--- Running Scenario ", i, "/", nrow(scenarios), ": ",
+             "N=", current_N, ", Censoring=", current_censoring, ", Effect=", current_effect, 
+             ", Seed=", current_seed, " ---\n"))
+  
+  if (current_effect == "Large") {
+    beta1.true <- 0.5; beta2.true <- 0.5; gamma1.true <- 1; gamma2.true <- 0.9 
+  } else { 
+    beta1.true <- 0.5; beta2.true <- 0.4; gamma1.true <- 0.5; gamma2.true <- 0.6
+  }
+  beta0.true <- c(beta1.true + gamma1.true, beta2.true + gamma2.true)
+  
+  rep <- 200
+  max_time <- 10  
+  surv_eff <- c(-0.5, 0.5)
+  p0 <- function(t) {0.25 + 0.05 * sin(t / max_time * 2 * pi) } 
+  mu0 <- function(t) {20 + 5 * cos(t / max_time * 2 * pi) } 
+  t_obs <- 1: max_time        
+  prob.observe <- 0.8        
+  
+  beta.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  se.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  
+  for (it in 1:rep) {
+    z1_baseline <- runif(current_N, 0, 1)
+    z2_baseline <- rbinom(current_N, 1, 0.5)
+    
+    sd_noise <- sqrt(0.1)
+    mu_correction <- -0.5 * sd_noise^2
+    
+    u_event  <- rlnorm(current_N, meanlog = mu_correction, sdlog = sd_noise)
+    u_marker <- rlnorm(current_N, meanlog = mu_correction, sdlog = 0)
+    
+    u_event_long  <- rep(u_event, each = length(t_obs))
+    u_marker_long <- rep(u_marker, each = length(t_obs))
+    u_root <- sqrt(u_event_long)
+    
+    death_rate <- 0.1 * exp(z1_baseline * surv_eff[1] + z2_baseline * surv_eff[2])* u_event_long
+    T_pat <- rexp(current_N, rate = death_rate)
+    
+    if (current_censoring == "High") {
+      baseline_censor_rate <- 0.1
+    } else { 
+      baseline_censor_rate <- 0.05
+    }
+    censoring_rate <- baseline_censor_rate * exp(z1_baseline * (-0.5) + z2_baseline * 0.5)
+    C_pat <- rexp(current_N, rate = censoring_rate)
+    
+    X_pat <- pmin(T_pat, C_pat)
+    delta_pat <- as.numeric(T_pat <= C_pat)
+    
+    sim.data <- data.frame(id = rep(1:current_N, each = length(t_obs)),
+                           time = rep(t_obs, current_N), X = rep(X_pat, each = length(t_obs)),
+                           delta = rep(delta_pat, each = length(t_obs)))
+    
+    sim.data$z1 <- rep(z1_baseline, each = length(t_obs))
+    sim.data$z2 <- rep(z2_baseline, each = length(t_obs))
+    
+    sim.data$R <- rbinom(nrow(sim.data), 1, prob.observe)
+    sim.data$R[sim.data$time > sim.data$X] <- 0
+    
+    linear_pred <- sim.data$z1 * beta1.true + sim.data$z2 * beta2.true 
+    prob_event <- p0(sim.data$time) * exp(linear_pred)* u_root
+    
+    prob_event[is.na(prob_event)] <- 0
+    prob_event <- pmin(prob_event, 1) 
+    prob_event[sim.data$time > sim.data$X] <- 0
+    
+    sim.data$dN <- rbinom(nrow(sim.data), 1, prob_event)
+    
+    linear_marker <- sim.data$z1 * gamma1.true + sim.data$z2 * gamma2.true
+    mean_marker <- mu0(sim.data$time) * exp(linear_marker) * u_root
+    
+    sim.data$Y <- 0
+    idx_event <- which(sim.data$dN == 1)
+    sim.data$Y[idx_event] <- rpois(length(idx_event), lambda = pmax(0, mean_marker[idx_event]))
+    
+    sim.data$dH <- sim.data$Y * sim.data$dN 
+    sim.data$dH[sim.data$R == 0] <- NA
+    
+    model_dat <- sim.data[sim.data$time <= sim.data$X, ]
+    
+    # 拟合
+    main_fit_result <- try(ipsw.fit.information_censor(model_dat, p = 2), silent = TRUE)
+    
+    if (!inherits(main_fit_result, "try-error")) {
+      beta.hat.matrix[it, ] <- main_fit_result$beta.hat
+      se.hat.matrix[it, ] <- main_fit_result$se.hat
+    }
+  }
+  
+  valid_runs <- which(!is.na(beta.hat.matrix[,1]) & !is.na(se.hat.matrix[,1]))
+  
+  if (length(valid_runs) > 1) {
+    valid_beta <- beta.hat.matrix[valid_runs, , drop=FALSE]
+    valid_se   <- se.hat.matrix[valid_runs, , drop=FALSE]
+    
+    bias <- colMeans(valid_beta) - beta0.true
+    ese <- apply(valid_beta, 2, sd)
+    ase <- colMeans(valid_se)
+    mse <- colMeans((valid_beta - matrix(beta0.true, nrow = nrow(valid_beta), ncol = 2, byrow = TRUE))^2)
+    
+    lower_bound <- valid_beta - 1.96 * valid_se
+    upper_bound <- valid_beta + 1.96 * valid_se
+    
+    cp_1 <- mean(lower_bound[,1] <= beta0.true[1] & upper_bound[,1] >= beta0.true[1])
+    cp_2 <- mean(lower_bound[,2] <= beta0.true[2] & upper_bound[,2] >= beta0.true[2])
+    cp <- c(cp_1, cp_2)
+    
+    results_summary <- data.frame(
+      Parameter = c("beta0_1", "beta0_2"),
+      TrueValue = beta0.true,
+      MeanEst = colMeans(valid_beta),
+      Bias = bias,
+      Empirical_SE = ese, 
+      Mean_Model_SE = ase, 
+      MSE = mse,
+      CP = cp
+    )
+    
+    scenario_info <- scenarios[i, , drop = FALSE]
+    rownames(scenario_info) <- NULL
+    full_results <- cbind(scenario_info, results_summary)
+    all_results_list[[i]] <- full_results
+  }
+}
+
+final_results <- do.call(rbind, all_results_list)
+print(final_results %>% as.data.frame())
+
+table_2 = final_results %>% as.data.frame()
+
+
+```
+# sd^2 = 0.25 logNorm
+```{r}
+scenarios <- expand.grid(
+  N = c(200, 500),
+  censoring_level = c("Low", "High"),
+  effect_size = c("Small")
+)
+
+scenarios$seed <- rep(3, 2) 
+all_results_list <- list()
+for (i in 1:nrow(scenarios)) {
+  
+  current_N <- scenarios$N[i]
+  current_censoring <- scenarios$censoring_level[i]
+  current_effect <- scenarios$effect_size[i]
+  current_seed <- scenarios$seed[i]
+  
+  set.seed(current_seed)
+  
+  cat(paste0("\n--- Running Scenario ", i, "/", nrow(scenarios), ": ",
+             "N=", current_N, ", Censoring=", current_censoring, ", Effect=", current_effect, 
+             ", Seed=", current_seed, " ---\n"))
+  
+  if (current_effect == "Large") {
+    beta1.true <- 0.5; beta2.true <- 0.5; gamma1.true <- 1; gamma2.true <- 0.9 
+  } else { 
+    beta1.true <- 0.5; beta2.true <- 0.4; gamma1.true <- 0.5; gamma2.true <- 0.6
+  }
+  beta0.true <- c(beta1.true + gamma1.true, beta2.true + gamma2.true)
+  
+  rep <- 200
+  max_time <- 10  
+  surv_eff <- c(-0.5, 0.5)
+  p0 <- function(t) {0.25 + 0.05 * sin(t / max_time * 2 * pi) } 
+  mu0 <- function(t) {20 + 5 * cos(t / max_time * 2 * pi) } 
+  t_obs <- 1: max_time        
+  prob.observe <- 0.8        
+  
+  beta.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  se.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  
+  for (it in 1:rep) {
+    z1_baseline <- runif(current_N, 0, 1)
+    z2_baseline <- rbinom(current_N, 1, 0.5)
+    
+    sd_noise <- sqrt(0.25)
+    mu_correction <- -0.5 * sd_noise^2
+    
+    u_event  <- rlnorm(current_N, meanlog = mu_correction, sdlog = sd_noise)
+    u_marker <- rlnorm(current_N, meanlog = mu_correction, sdlog = 0)
+    
+    u_event_long  <- rep(u_event, each = length(t_obs))
+    u_marker_long <- rep(u_marker, each = length(t_obs))
+    u_root <- sqrt(u_event_long)
+    
+    death_rate <- 0.1 * exp(z1_baseline * surv_eff[1] + z2_baseline * surv_eff[2])* u_event_long
+    T_pat <- rexp(current_N, rate = death_rate)
+    
+    if (current_censoring == "High") {
+      baseline_censor_rate <- 0.1
+    } else { 
+      baseline_censor_rate <- 0.05
+    }
+    censoring_rate <- baseline_censor_rate * exp(z1_baseline * (-0.5) + z2_baseline * 0.5)
+    C_pat <- rexp(current_N, rate = censoring_rate)
+    
+    X_pat <- pmin(T_pat, C_pat)
+    delta_pat <- as.numeric(T_pat <= C_pat)
+    
+    sim.data <- data.frame(id = rep(1:current_N, each = length(t_obs)),
+                           time = rep(t_obs, current_N), X = rep(X_pat, each = length(t_obs)),
+                           delta = rep(delta_pat, each = length(t_obs)))
+    
+    sim.data$z1 <- rep(z1_baseline, each = length(t_obs))
+    sim.data$z2 <- rep(z2_baseline, each = length(t_obs))
+    
+    sim.data$R <- rbinom(nrow(sim.data), 1, prob.observe)
+    sim.data$R[sim.data$time > sim.data$X] <- 0
+    
+    linear_pred <- sim.data$z1 * beta1.true + sim.data$z2 * beta2.true 
+    prob_event <- p0(sim.data$time) * exp(linear_pred)* u_root
+    
+    prob_event[is.na(prob_event)] <- 0
+    prob_event <- pmin(prob_event, 1) 
+    prob_event[sim.data$time > sim.data$X] <- 0
+    
+    sim.data$dN <- rbinom(nrow(sim.data), 1, prob_event)
+    
+    linear_marker <- sim.data$z1 * gamma1.true + sim.data$z2 * gamma2.true
+    mean_marker <- mu0(sim.data$time) * exp(linear_marker) * u_root
+    
+    sim.data$Y <- 0
+    idx_event <- which(sim.data$dN == 1)
+    sim.data$Y[idx_event] <- rpois(length(idx_event), lambda = pmax(0, mean_marker[idx_event]))
+    
+    sim.data$dH <- sim.data$Y * sim.data$dN 
+    sim.data$dH[sim.data$R == 0] <- NA
+    
+    model_dat <- sim.data[sim.data$time <= sim.data$X, ]
+    
+    # 拟合
+    main_fit_result <- try(ipsw.fit.information_censor(model_dat, p = 2), silent = TRUE)
+    
+    if (!inherits(main_fit_result, "try-error")) {
+      beta.hat.matrix[it, ] <- main_fit_result$beta.hat
+      se.hat.matrix[it, ] <- main_fit_result$se.hat
+    }
+  }
+  
+  valid_runs <- which(!is.na(beta.hat.matrix[,1]) & !is.na(se.hat.matrix[,1]))
+  
+  if (length(valid_runs) > 1) {
+    valid_beta <- beta.hat.matrix[valid_runs, , drop=FALSE]
+    valid_se   <- se.hat.matrix[valid_runs, , drop=FALSE]
+    
+    bias <- colMeans(valid_beta) - beta0.true
+    ese <- apply(valid_beta, 2, sd)
+    ase <- colMeans(valid_se)
+    mse <- colMeans((valid_beta - matrix(beta0.true, nrow = nrow(valid_beta), ncol = 2, byrow = TRUE))^2)
+    
+    lower_bound <- valid_beta - 1.96 * valid_se
+    upper_bound <- valid_beta + 1.96 * valid_se
+    
+    cp_1 <- mean(lower_bound[,1] <= beta0.true[1] & upper_bound[,1] >= beta0.true[1])
+    cp_2 <- mean(lower_bound[,2] <= beta0.true[2] & upper_bound[,2] >= beta0.true[2])
+    cp <- c(cp_1, cp_2)
+    
+    results_summary <- data.frame(
+      Parameter = c("beta0_1", "beta0_2"),
+      TrueValue = beta0.true,
+      MeanEst = colMeans(valid_beta),
+      Bias = bias,
+      Empirical_SE = ese, 
+      Mean_Model_SE = ase, 
+      MSE = mse,
+      CP = cp
+    )
+    
+    scenario_info <- scenarios[i, , drop = FALSE]
+    rownames(scenario_info) <- NULL
+    full_results <- cbind(scenario_info, results_summary)
+    all_results_list[[i]] <- full_results
+  }
+}
+
+final_results <- do.call(rbind, all_results_list)
+print(final_results %>% as.data.frame())
+
+table_3 = final_results %>% as.data.frame()
+
+
+```
+
+# sd^2 = 0.5 logNorm
+```{r}
+scenarios <- expand.grid(
+  N = c(200, 500),
+  censoring_level = c("Low", "High"),
+  effect_size = c("Small")
+)
+
+scenarios$seed <- rep(3, 2) 
+all_results_list <- list()
+for (i in 1:nrow(scenarios)) {
+  
+  current_N <- scenarios$N[i]
+  current_censoring <- scenarios$censoring_level[i]
+  current_effect <- scenarios$effect_size[i]
+  current_seed <- scenarios$seed[i]
+  
+  set.seed(current_seed)
+  
+  cat(paste0("\n--- Running Scenario ", i, "/", nrow(scenarios), ": ",
+             "N=", current_N, ", Censoring=", current_censoring, ", Effect=", current_effect, 
+             ", Seed=", current_seed, " ---\n"))
+  
+  if (current_effect == "Large") {
+    beta1.true <- 0.5; beta2.true <- 0.5; gamma1.true <- 1; gamma2.true <- 0.9 
+  } else { 
+    beta1.true <- 0.5; beta2.true <- 0.4; gamma1.true <- 0.5; gamma2.true <- 0.6
+  }
+  beta0.true <- c(beta1.true + gamma1.true, beta2.true + gamma2.true)
+  
+  rep <- 200
+  max_time <- 10  
+  surv_eff <- c(-0.5, 0.5)
+  p0 <- function(t) {0.25 + 0.05 * sin(t / max_time * 2 * pi) } 
+  mu0 <- function(t) {20 + 5 * cos(t / max_time * 2 * pi) } 
+  t_obs <- 1: max_time        
+  prob.observe <- 0.8        
+  
+  beta.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  se.hat.matrix <- matrix(NA, nrow = rep, ncol = 2)
+  
+  for (it in 1:rep) {
+    z1_baseline <- runif(current_N, 0, 1)
+    z2_baseline <- rbinom(current_N, 1, 0.5)
+    
+    sd_noise <- sqrt(0.5)
+    mu_correction <- -0.5 * sd_noise^2
+    
+    u_event  <- rlnorm(current_N, meanlog = mu_correction, sdlog = sd_noise)
+    u_marker <- rlnorm(current_N, meanlog = mu_correction, sdlog = 0)
+    
+    u_event_long  <- rep(u_event, each = length(t_obs))
+    u_marker_long <- rep(u_marker, each = length(t_obs))
+    u_root <- sqrt(u_event_long)
+    
+    death_rate <- 0.1 * exp(z1_baseline * surv_eff[1] + z2_baseline * surv_eff[2])* u_event_long
+    T_pat <- rexp(current_N, rate = death_rate)
+    
+    if (current_censoring == "High") {
+      baseline_censor_rate <- 0.1
+    } else { 
+      baseline_censor_rate <- 0.05
+    }
+    censoring_rate <- baseline_censor_rate * exp(z1_baseline * (-0.5) + z2_baseline * 0.5)
+    C_pat <- rexp(current_N, rate = censoring_rate)
+    
+    X_pat <- pmin(T_pat, C_pat)
+    delta_pat <- as.numeric(T_pat <= C_pat)
+    
+    sim.data <- data.frame(id = rep(1:current_N, each = length(t_obs)),
+                           time = rep(t_obs, current_N), X = rep(X_pat, each = length(t_obs)),
+                           delta = rep(delta_pat, each = length(t_obs)))
+    
+    sim.data$z1 <- rep(z1_baseline, each = length(t_obs))
+    sim.data$z2 <- rep(z2_baseline, each = length(t_obs))
+    
+    sim.data$R <- rbinom(nrow(sim.data), 1, prob.observe)
+    sim.data$R[sim.data$time > sim.data$X] <- 0
+    
+    linear_pred <- sim.data$z1 * beta1.true + sim.data$z2 * beta2.true 
+    prob_event <- p0(sim.data$time) * exp(linear_pred)* u_root
+    
+    prob_event[is.na(prob_event)] <- 0
+    prob_event <- pmin(prob_event, 1) 
+    prob_event[sim.data$time > sim.data$X] <- 0
+    
+    sim.data$dN <- rbinom(nrow(sim.data), 1, prob_event)
+    
+    linear_marker <- sim.data$z1 * gamma1.true + sim.data$z2 * gamma2.true
+    mean_marker <- mu0(sim.data$time) * exp(linear_marker) * u_root
+    
+    sim.data$Y <- 0
+    idx_event <- which(sim.data$dN == 1)
+    sim.data$Y[idx_event] <- rpois(length(idx_event), lambda = pmax(0, mean_marker[idx_event]))
+    
+    sim.data$dH <- sim.data$Y * sim.data$dN 
+    sim.data$dH[sim.data$R == 0] <- NA
+    
+    model_dat <- sim.data[sim.data$time <= sim.data$X, ]
+    
+    # 拟合
+    main_fit_result <- try(ipsw.fit.information_censor(model_dat, p = 2), silent = TRUE)
+    
+    if (!inherits(main_fit_result, "try-error")) {
+      beta.hat.matrix[it, ] <- main_fit_result$beta.hat
+      se.hat.matrix[it, ] <- main_fit_result$se.hat
+    }
+  }
+  
+  valid_runs <- which(!is.na(beta.hat.matrix[,1]) & !is.na(se.hat.matrix[,1]))
+  
+  if (length(valid_runs) > 1) {
+    valid_beta <- beta.hat.matrix[valid_runs, , drop=FALSE]
+    valid_se   <- se.hat.matrix[valid_runs, , drop=FALSE]
+    
+    bias <- colMeans(valid_beta) - beta0.true
+    ese <- apply(valid_beta, 2, sd)
+    ase <- colMeans(valid_se)
+    mse <- colMeans((valid_beta - matrix(beta0.true, nrow = nrow(valid_beta), ncol = 2, byrow = TRUE))^2)
+    
+    lower_bound <- valid_beta - 1.96 * valid_se
+    upper_bound <- valid_beta + 1.96 * valid_se
+    
+    cp_1 <- mean(lower_bound[,1] <= beta0.true[1] & upper_bound[,1] >= beta0.true[1])
+    cp_2 <- mean(lower_bound[,2] <= beta0.true[2] & upper_bound[,2] >= beta0.true[2])
+    cp <- c(cp_1, cp_2)
+    
+    results_summary <- data.frame(
+      Parameter = c("beta0_1", "beta0_2"),
+      TrueValue = beta0.true,
+      MeanEst = colMeans(valid_beta),
+      Bias = bias,
+      Empirical_SE = ese, 
+      Mean_Model_SE = ase, 
+      MSE = mse,
+      CP = cp
+    )
+    
+    scenario_info <- scenarios[i, , drop = FALSE]
+    rownames(scenario_info) <- NULL
+    full_results <- cbind(scenario_info, results_summary)
+    all_results_list[[i]] <- full_results
+  }
+}
+
+final_results <- do.call(rbind, all_results_list)
+print(final_results %>% as.data.frame())
+
+table_4 = final_results %>% as.data.frame()
+
+```
